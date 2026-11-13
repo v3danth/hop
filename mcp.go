@@ -84,7 +84,7 @@ var mcpTools = []mcpTool{
 			if err := json.Unmarshal(raw, &args); err != nil {
 				return nil, fmt.Errorf("bad arguments: %w", err)
 			}
-			if err := c.remove(args.Name); err != nil {
+			if err := c.remove(args.Name, 0); err != nil {
 				return nil, err
 			}
 			return "removed " + args.Name, nil
@@ -127,11 +127,12 @@ func serveMCP(in io.Reader, out io.Writer, c client) error {
 func handleMCP(c client, req rpcRequest) (any, *rpcError) {
 	switch req.Method {
 	case "initialize":
+		// Tools work the same in every protocol version so far, so agree to
+		// the client's, falling back to a known one.
 		var p struct {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
-		json.Unmarshal(req.Params, &p)
-		if p.ProtocolVersion == "" {
+		if err := json.Unmarshal(req.Params, &p); err != nil || p.ProtocolVersion == "" {
 			p.ProtocolVersion = "2025-06-18"
 		}
 		return map[string]any{

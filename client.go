@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,7 @@ type client struct {
 func newClient() client {
 	base := os.Getenv("HOP_URL")
 	if base == "" {
-		base = "http://" + strings.TrimSuffix(defaultAddr, ":80")
+		base = "http://" + defaultIP
 	}
 	return client{base: strings.TrimRight(base, "/"), http: &http.Client{Timeout: 5 * time.Second}}
 }
@@ -43,7 +44,18 @@ func (c client) put(s Service, replace bool) (serviceView, error) {
 	return out, err
 }
 
-// apiError keeps the HTTP status so callers can tell a taken name apart.
+// remove deletes name. With pid > 0 it does so only while that process
+// holds the name; otherwise the server answers not found.
+func (c client) remove(name string, pid int) error {
+	path := "/_hop/api/services/" + url.PathEscape(name)
+	if pid > 0 {
+		path += "?pid=" + strconv.Itoa(pid)
+	}
+	return c.call(http.MethodDelete, path, nil, nil)
+}
+
+// apiError keeps the HTTP status, so callers can tell a taken or missing
+// name from other failures.
 type apiError struct {
 	status  int
 	message string
@@ -51,14 +63,13 @@ type apiError struct {
 
 func (e *apiError) Error() string { return e.message }
 
-func isNameTaken(err error) bool {
+func hasStatus(err error, status int) bool {
 	var apiErr *apiError
-	return errors.As(err, &apiErr) && apiErr.status == http.StatusConflict
+	return errors.As(err, &apiErr) && apiErr.status == status
 }
 
-func (c client) remove(name string) error {
-	return c.call(http.MethodDelete, "/_hop/api/services/"+url.PathEscape(name), nil, nil)
-}
+func isNameTaken(err error) bool { return hasStatus(err, http.StatusConflict) }
+func isNotFound(err error) bool  { return hasStatus(err, http.StatusNotFound) }
 
 func (c client) call(method, path string, body, out any) error {
 	var reqBody io.Reader
@@ -78,7 +89,7 @@ func (c client) call(method, path string, body, out any) error {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("hop server not reachable at %s (start it with `hop serve`): %w", c.base, err)
+		return fmt.Errorf("hop is not reachable at %s; is it installed and running? (%w)", c.base, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -100,11 +111,19 @@ func (c client) call(method, path string, body, out any) error {
 	return nil
 }
 
-// parseTarget reads what a person types as a destination: a bare number is a
-// local port, anything else is a website, with https:// added when missing.
+// localAppPattern matches the ways people write an app on this machine:
+// 3000, :3000, localhost:3000, http://127.0.0.1:3000/ and so on.
+var localAppPattern = regexp.MustCompile(`(?i)^(?:([0-9]+)|(?:http://)?(?:localhost|127\.0\.0\.1|\[::1\])?:([0-9]+)/?)$`)
+
+// parseTarget reads what a person types as a destination: a local app's
+// port, or a website, with https:// added when no scheme is given.
 func parseTarget(raw string) Service {
 	raw = strings.TrimSpace(raw)
-	if port, err := strconv.Atoi(raw); err == nil {
+	if m := localAppPattern.FindStringSubmatch(raw); m != nil {
+		port, err := strconv.Atoi(m[1] + m[2]) // exactly one group matched
+		if err != nil {
+			port = -1 // too large; validation reports it as out of range
+		}
 		return Service{Port: port}
 	}
 	// Keep any explicit scheme, so ftp://x is rejected rather than saved as

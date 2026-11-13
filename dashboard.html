@@ -154,6 +154,10 @@ tbody tr:hover { background: var(--row-hover); }
 'use strict';
 const API = '/_hop/api/services';
 const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+// Browsers read these as IP addresses: http://123/ opens 0.0.0.123.
+const IPV4_LIKE_RE = /^(?:[0-9]+|0x[0-9a-f]*)$/;
+// 3000, :3000, localhost:3000, http://127.0.0.1:3000/ ... as in client.go.
+const LOCAL_APP_RE = /^(?:([0-9]+)|(?:http:\/\/)?(?:localhost|127\.0\.0\.1|\[::1\])?:([0-9]+)\/?)$/i;
 const RESERVED = ['go', 'hop', 'localhost'];
 const STATUS = {
   up: {icon: '●', text: 'Running'},
@@ -163,6 +167,7 @@ const STATUS = {
 
 const $ = (id) => document.getElementById(id);
 let services = [];
+let servicesJSON = '';
 let undoTimer = 0;
 
 function relativeTime(iso) {
@@ -193,22 +198,28 @@ function serviceRow(svc) {
   const st = STATUS[svc.status] || STATUS.redirect;
   const linkText = svc.link.replace(/^http:\/\//, '');
   return el('tr', {},
-    el('td', {class: 'name'}, el('a', {href: svc.link, target: '_blank', rel: 'noopener', title: svc.link}, linkText),
+    el('td', {class: 'name'}, el('a', {href: svc.link, target: '_blank', rel: 'noopener', title: svc.link, 'data-focus-key': `link:${svc.name}`}, linkText),
       svc.pid ? el('span', {class: 'tag', title: `Removed automatically when process ${svc.pid} exits`}, 'auto') : ''),
     el('td', {'data-label': 'Goes to', class: 'target-cell'}, el('div', {class: 'target', title: targetText(svc)}, targetText(svc))),
     el('td', {'data-label': 'Status'}, el('span', {class: `status ${svc.status}`}, el('span', {'aria-hidden': 'true'}, st.icon), st.text)),
     el('td', {'data-label': 'Visits', class: 'num'}, String(svc.hits)),
-    el('td', {'data-label': 'Last visit', class: 'when', title: svc.lastHit || ''}, relativeTime(svc.lastHit)),
+    el('td', {'data-label': 'Last visit', class: 'when', title: svc.lastHit || '', 'data-last-hit': svc.lastHit || ''}, relativeTime(svc.lastHit)),
     el('td', {},
       el('div', {class: 'actions'},
-        el('button', {class: 'small', type: 'button', onclick: (e) => copyLink(svc, e.currentTarget)}, 'Copy link'),
-        el('button', {class: 'small danger', type: 'button', onclick: () => removeService(svc)}, 'Remove'))));
+        el('button', {class: 'small', type: 'button', 'data-focus-key': `copy:${svc.name}`, onclick: (e) => copyLink(svc, e.currentTarget)}, 'Copy link'),
+        el('button', {class: 'small danger', type: 'button', 'data-focus-key': `remove:${svc.name}`, onclick: () => removeService(svc)}, 'Remove'))));
 }
 
 function render() {
+  // Rebuilding the rows drops focus; put it back on the same control.
+  const focusKey = document.activeElement?.dataset?.focusKey;
   const q = $('filter').value.trim().toLowerCase();
   const shown = services.filter((s) => !q || s.name.includes(q) || targetText(s).toLowerCase().includes(q));
   $('rows').replaceChildren(...shown.map(serviceRow));
+  if (focusKey) {
+    const same = document.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`);
+    (same || $('filter')).focus();
+  }
   $('empty').hidden = services.length > 0;
   $('no-match').hidden = shown.length > 0 || services.length === 0;
   $('no-match-title').textContent = `No shortcuts match "${q}"`;
@@ -234,8 +245,13 @@ async function api(method, path, body) {
 async function refresh() {
   try {
     const data = await api('GET', API);
-    services = data.services;
     $('banner').hidden = true;
+    // Polling every few seconds must not rebuild an unchanged table: that
+    // would reset hover, focus and the Copied feedback each time.
+    const json = JSON.stringify(data.services);
+    if (json === servicesJSON) return;
+    servicesJSON = json;
+    services = data.services;
     render();
   } catch (e) {
     $('banner').textContent = 'Can\'t reach hop. Is the server still running? Retrying every few seconds.';
@@ -245,8 +261,9 @@ async function refresh() {
 
 function parseTarget(raw) {
   const t = raw.trim();
-  if (/^\d+$/.test(t)) return {port: Number(t)};
   if (!t) return {};
+  const local = LOCAL_APP_RE.exec(t);
+  if (local) return {port: Number(local[1] || local[2])};
   return {url: t.includes('://') ? t : `https://${t}`};
 }
 
@@ -266,8 +283,12 @@ function validateForm() {
   const existing = existingService(name);
   const target = parseTarget($('target').value);
   let ok = true;
-  if (name && (!NAME_RE.test(name) || RESERVED.includes(name))) {
-    setHint('name', RESERVED.includes(name) ? `"${name}" is reserved for hop itself` : 'Use only lowercase letters, digits and dashes', true);
+  const nameError = !name ? '' :
+    !NAME_RE.test(name) ? 'Use only lowercase letters, digits and dashes' :
+    IPV4_LIKE_RE.test(name) ? 'Browsers read this as an IP address; add a letter' :
+    RESERVED.includes(name) ? `"${name}" is reserved for hop itself` : '';
+  if (nameError) {
+    setHint('name', nameError, true);
     ok = false;
   } else {
     setHint('name', existing ? `${name}/ already goes to ${targetText(existing)}` : 'Lowercase letters, digits and dashes', false);
@@ -315,7 +336,10 @@ async function removeService(svc) {
   render();
   try {
     await api('DELETE', `${API}/${encodeURIComponent(svc.name)}`);
-    showToast(`Removed ${svc.name}/`, () => api('POST', API, {name: svc.name, url: svc.url, port: svc.port, pid: svc.pid}).then(refresh));
+    const restore = {name: svc.name, url: svc.url, port: svc.port, pid: svc.pid, replace: false};
+    showToast(`Removed ${svc.name}/`, () => api('POST', API, restore)
+      .then(refresh)
+      .catch((err) => showToast(`Couldn't undo: ${err.message}`)));
     // The focused Remove button left with its row; Undo is the likely next step.
     $('undo').focus();
   } catch (err) {
@@ -336,14 +360,38 @@ function showToast(text, undo) {
   }, 6000);
 }
 
+// navigator.clipboard exists only in secure contexts, and http://hop/ is not
+// one, so fall back to selecting hidden text and the older copy command.
+async function writeClipboard(text) {
+  if (window.isSecureContext && navigator.clipboard) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = el('textarea', {readonly: '', 'aria-hidden': 'true', style: 'position:fixed;top:0;left:0;opacity:0'});
+  area.value = text;
+  document.body.append(area);
+  area.select();
+  const copied = document.execCommand('copy');
+  area.remove();
+  if (!copied) throw new Error('copy command failed');
+}
+
 async function copyLink(svc, button) {
   try {
-    await navigator.clipboard.writeText(svc.link);
+    await writeClipboard(svc.link);
     button.textContent = 'Copied';
   } catch {
     button.textContent = 'Copy failed';
   }
+  button.focus(); // the fallback moved focus to its hidden text
   setTimeout(() => { button.textContent = 'Copy link'; }, 1500);
+}
+
+// Relative visit times age without any data change, so refresh them in place.
+function updateVisitTimes() {
+  for (const cell of document.querySelectorAll('td.when')) {
+    cell.textContent = relativeTime(cell.dataset.lastHit);
+  }
 }
 
 $('add-form').addEventListener('submit', addService);
@@ -366,6 +414,7 @@ if (prefill) {
 validateForm();
 refresh();
 setInterval(refresh, 3000);
+setInterval(updateVisitTimes, 30000);
 </script>
 </body>
 </html>

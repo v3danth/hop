@@ -1,0 +1,12 @@
+version: "2"
+
+linters:
+  exclusions:
+    # Skip unchecked errors from Close, Flush, fmt.Print* and similar, where
+    # there is nothing useful to do with the error.
+    presets:
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt

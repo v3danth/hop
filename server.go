@@ -22,40 +22,44 @@ import (
 //go:embed dashboard.html
 var dashboardHTML []byte
 
-// Hosts that mean "hop itself": the dashboard, or go/<name> path routing.
-var hopHosts = []string{"go", "hop", "localhost", "127.0.0.1", "::1", "go.localhost", "hop.localhost"}
+// Host names that mean hop itself: the dashboard, the API and go/<name>
+// links. Loopback IPs count too; see isHopHost.
+var hopHosts = []string{"go", "hop", "localhost", "go.localhost", "hop.localhost"}
 
 // Server routes by Host header: website names redirect, local app names are
-// reverse proxied to their loopback port.
+// reverse proxied to their port, and hop's own names serve the dashboard,
+// the API and go/<name> links.
 type Server struct {
-	reg        *Registry
-	listenPort int
-	shortNames bool // hosts file is managed, so single-word names resolve
-	proxy      *httputil.ReverseProxy
-	api        http.Handler
+	reg   *Registry
+	links linkStyle
+	proxy *httputil.ReverseProxy
+	api   http.Handler
 }
 
-type proxyTarget struct {
-	name string
-	port int
+// linkStyle builds the URL a person types for a name on this machine.
+type linkStyle struct {
+	shortNames bool // the hosts file is managed, so yt/ resolves, not just yt.localhost
+	httpPort   int
+	httpsPort  int // 0 when HTTPS is off
 }
 
-type proxyTargetKey struct{}
-
-func newServer(reg *Registry, listenPort int, shortNames bool) *Server {
-	s := &Server{reg: reg, listenPort: listenPort, shortNames: shortNames}
-	s.proxy = &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			t := pr.In.Context().Value(proxyTargetKey{}).(proxyTarget)
-			pr.SetURL(&url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(t.port)})
-			pr.SetXForwarded()
-			// Dev servers (Vite, webpack, Next) reject unknown Host headers, so
-			// the app sees the request as if it came to localhost directly.
-			pr.Out.Host = "localhost:" + strconv.Itoa(t.port)
-		},
-		ErrorHandler: s.writeAppNotResponding,
+func (l linkStyle) url(scheme, name string) string {
+	host, port, defaultPort := name, l.httpPort, 80
+	if scheme == "https" {
+		port, defaultPort = l.httpsPort, 443
 	}
+	if !l.shortNames {
+		host += ".localhost"
+	}
+	if port != defaultPort {
+		host += ":" + strconv.Itoa(port)
+	}
+	return scheme + "://" + host
+}
 
+func newServer(reg *Registry, links linkStyle) *Server {
+	s := &Server{reg: reg, links: links}
+	s.proxy = newAppProxy(s.writeAppNotResponding)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_hop/{$}", serveDashboard)
 	mux.HandleFunc("GET /_hop/api/services", s.listServices)
@@ -70,20 +74,21 @@ func newServer(reg *Registry, listenPort int, shortNames bool) *Server {
 // its own, including /_hop/.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := requestHost(r)
-	if isHopHost(host) {
-		if strings.HasPrefix(r.URL.Path, "/_hop/") {
-			s.api.ServeHTTP(w, r)
-			return
-		}
-		name, rest := splitFirstSegment(r.URL.EscapedPath())
-		if name == "" {
-			http.Redirect(w, r, "/_hop/", http.StatusFound)
-			return
-		}
-		s.routeFromGo(w, r, name, rest)
+	if !isHopHost(host) {
+		s.routeByHost(w, r, strings.TrimSuffix(host, ".localhost"))
 		return
 	}
-	s.routeByHost(w, r, strings.TrimSuffix(host, ".localhost"))
+	if strings.HasPrefix(r.URL.Path, "/_hop/") {
+		s.api.ServeHTTP(w, r)
+		return
+	}
+	name, rest := splitFirstSegment(r.URL.EscapedPath())
+	if name == "" {
+		http.Redirect(w, r, "/_hop/", http.StatusFound)
+		return
+	}
+	// Browsers lowercase host names but not paths, so go/YT must find yt.
+	s.routeFromGo(w, r, strings.ToLower(name), rest)
 }
 
 // routeFromGo handles go/<name>/<rest>. Local apps are sent to their own host
@@ -91,11 +96,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routeFromGo(w http.ResponseWriter, r *http.Request, name, rest string) {
 	svc, ok := s.reg.Lookup(name)
 	if !ok {
-		s.writeUnknownName(w, name)
+		s.writeUnknownName(w, r, name)
 		return
 	}
 	if svc.isLocal() {
-		http.Redirect(w, r, s.serviceLink(name)+withQuery(rest, r.URL.RawQuery), http.StatusFound)
+		http.Redirect(w, r, s.links.url(requestScheme(r), name)+withQuery(rest, r.URL.RawQuery), http.StatusFound)
 		return
 	}
 	s.reg.RecordHit(name)
@@ -105,7 +110,7 @@ func (s *Server) routeFromGo(w http.ResponseWriter, r *http.Request, name, rest 
 func (s *Server) routeByHost(w http.ResponseWriter, r *http.Request, name string) {
 	svc, ok := s.reg.Lookup(name)
 	if !ok {
-		s.writeUnknownName(w, name)
+		s.writeUnknownName(w, r, name)
 		return
 	}
 	if !svc.isLocal() {
@@ -117,55 +122,15 @@ func (s *Server) routeByHost(w http.ResponseWriter, r *http.Request, name string
 	if r.Header.Get("Sec-Fetch-Mode") == "navigate" {
 		s.reg.RecordHit(name)
 	}
-	ctx := context.WithValue(r.Context(), proxyTargetKey{}, proxyTarget{name: name, port: svc.Port})
-	s.proxy.ServeHTTP(w, r.WithContext(ctx))
+	origin := requestScheme(r) + "://" + r.Host
+	s.proxy.ServeHTTP(w, withAppTarget(r, appTarget{name: name, port: svc.Port, origin: origin}))
 }
 
-// serviceLink is the URL a person types for name, matching how names resolve
-// on this machine.
-func (s *Server) serviceLink(name string) string {
-	host := name
-	if !s.shortNames {
-		host += ".localhost"
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
 	}
-	if s.listenPort != 80 {
-		host += ":" + strconv.Itoa(s.listenPort)
-	}
-	return "http://" + host
-}
-
-// redirectTarget appends the rest of the path to a website shortcut, or fills
-// it into %s so a shortcut like yt -> youtube.com/results?search_query=%s
-// turns yt/cats into a search. rest is the escaped path after the name.
-func redirectTarget(base, rest string, u *url.URL) string {
-	if strings.Contains(base, "%s") {
-		return strings.ReplaceAll(base, "%s", url.QueryEscape(searchTerm(rest, u)))
-	}
-	if rest == "/" {
-		rest = ""
-	}
-	return withQuery(strings.TrimRight(base, "/")+rest, u.RawQuery)
-}
-
-// searchTerm rebuilds what the person typed after name/. The browser splits
-// a term like "what is 2+2?" at the "?", so the query is part of the term.
-func searchTerm(rest string, u *url.URL) string {
-	raw := strings.TrimPrefix(rest, "/")
-	if u.RawQuery != "" || u.ForceQuery {
-		raw += "?" + u.RawQuery
-	}
-	term, err := url.PathUnescape(raw)
-	if err != nil {
-		return raw
-	}
-	return term
-}
-
-func withQuery(u, query string) string {
-	if query == "" {
-		return u
-	}
-	return u + "?" + query
+	return "http"
 }
 
 func requestHost(r *http.Request) string {
@@ -187,8 +152,9 @@ func splitFirstSegment(path string) (string, string) {
 }
 
 // sameMachineOnly blocks web pages from changing the registry: a malicious
-// site could otherwise POST here from the browser. DNS rebinding cannot reach
-// the API because ServeHTTP only routes hop's own local host names to it.
+// site could otherwise POST here from the browser. Requiring JSON forces a
+// CORS preflight, which hop never approves. DNS rebinding cannot reach the
+// API because ServeHTTP only routes hop's own names to it.
 func sameMachineOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if origin := r.Header.Get("Origin"); origin != "" {
@@ -216,8 +182,8 @@ func (s *Server) servesName(name string) bool {
 	return ok
 }
 
-// isHopHost reports whether host means hop itself: its names, or a loopback
-// IP such as 127.0.0.2 that the CLI uses to reach it.
+// isHopHost reports whether host means hop itself: one of its names, or a
+// loopback IP such as 127.0.0.2, which is how the CLI reaches it.
 func isHopHost(host string) bool {
 	if slices.Contains(hopHosts, host) {
 		return true
@@ -235,7 +201,12 @@ func isLocalHostName(host string) bool {
 func serveDashboard(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Write(dashboardHTML)
+	// No framing, so another page cannot trick a click on Remove or Replace.
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	if _, err := w.Write(dashboardHTML); err != nil {
+		slog.Debug("write dashboard failed", "err", err)
+	}
 }
 
 // serviceView is a Service plus what the dashboard and CLI need to show it.
@@ -246,9 +217,11 @@ type serviceView struct {
 }
 
 type listResponse struct {
-	ListenPort int           `json:"listenPort"`
-	ShortNames bool          `json:"shortNames"`
-	Services   []serviceView `json:"services"`
+	Services []serviceView `json:"services"`
+}
+
+func (s *Server) view(svc Service) serviceView {
+	return serviceView{Service: svc, Link: s.links.url("http", svc.Name) + "/", Status: "redirect"}
 }
 
 func (s *Server) listServices(w http.ResponseWriter, _ *http.Request) {
@@ -256,22 +229,13 @@ func (s *Server) listServices(w http.ResponseWriter, _ *http.Request) {
 	views := make([]serviceView, len(list))
 	var wg sync.WaitGroup
 	for i, svc := range list {
-		views[i] = serviceView{Service: svc, Link: s.serviceLink(svc.Name) + "/", Status: "redirect"}
+		views[i] = s.view(svc)
 		if svc.isLocal() {
 			wg.Go(func() { views[i].Status = portStatus(svc.Port) })
 		}
 	}
 	wg.Wait()
-	writeJSON(w, http.StatusOK, listResponse{ListenPort: s.listenPort, ShortNames: s.shortNames, Services: views})
-}
-
-func portStatus(port int) string {
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 200*time.Millisecond)
-	if err != nil {
-		return "down"
-	}
-	conn.Close()
-	return "up"
+	writeJSON(w, http.StatusOK, listResponse{Services: views})
 }
 
 // putRequest is a Service plus whether it may replace an existing name.
@@ -286,37 +250,47 @@ type putRequest struct {
 func (s *Server) putService(w http.ResponseWriter, r *http.Request) {
 	var in putRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&in); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "body must be JSON like {\"name\":\"yt\",\"url\":\"https://youtube.com\"}")
+		writeJSONError(w, http.StatusBadRequest, `body must be JSON like {"name":"yt","url":"https://youtube.com"}`)
 		return
 	}
-	in.Name = strings.ToLower(strings.TrimSpace(in.Name))
-	in.URL = strings.TrimSpace(in.URL)
-	put := s.reg.Put
-	if in.Replace != nil && !*in.Replace {
-		put = s.reg.Add
-	}
-	svc, err := put(Service{Name: in.Name, URL: in.URL, Port: in.Port, PID: in.PID})
+	svc := Service{Name: strings.ToLower(strings.TrimSpace(in.Name)), URL: strings.TrimSpace(in.URL), Port: in.Port, PID: in.PID}
+	replace := in.Replace == nil || *in.Replace
+	svc, err := s.reg.Put(svc, replace)
 	var taken *NameTakenError
-	if errors.As(err, &taken) {
+	switch {
+	case errors.As(err, &taken):
 		writeJSONError(w, http.StatusConflict, err.Error())
 		return
-	}
-	if err != nil {
+	case err != nil:
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	slog.Info("service registered", "name", svc.Name, "url", svc.URL, "port", svc.Port, "pid", svc.PID)
-	status := "redirect"
+	view := s.view(svc)
 	if svc.isLocal() {
-		status = portStatus(svc.Port)
+		view.Status = portStatus(svc.Port)
 	}
-	writeJSON(w, http.StatusCreated, serviceView{Service: svc, Link: s.serviceLink(svc.Name) + "/", Status: status})
+	writeJSON(w, http.StatusCreated, view)
 }
 
+// deleteService removes a name. With ?pid=N it removes the name only while
+// that process holds it, which is how hop run cleans up after itself.
 func (s *Server) deleteService(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	if !s.reg.Remove(name) {
-		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no service named %q", name))
+	name := strings.ToLower(r.PathValue("name"))
+	pid := 0
+	if p := r.URL.Query().Get("pid"); p != "" {
+		var err error
+		if pid, err = strconv.Atoi(p); err != nil || pid <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "pid must be a positive number")
+			return
+		}
+	}
+	if !s.reg.Remove(name, pid) {
+		msg := fmt.Sprintf("no service named %q", name)
+		if pid > 0 {
+			msg += fmt.Sprintf(" registered by process %d", pid)
+		}
+		writeJSONError(w, http.StatusNotFound, msg)
 		return
 	}
 	slog.Info("service removed", "name", name)
@@ -346,7 +320,9 @@ func freePort() (int, error) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Debug("write response failed", "err", err)
+	}
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
@@ -355,24 +331,30 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 // dashboardLink is absolute because these pages are shown on other hosts,
 // where /_hop/ belongs to the app, not to hop.
-func (s *Server) dashboardLink() string {
-	return s.serviceLink("hop") + "/_hop/"
+func (s *Server) dashboardLink(r *http.Request) string {
+	return s.links.url(requestScheme(r), "hop") + "/_hop/"
 }
 
-func (s *Server) writeUnknownName(w http.ResponseWriter, name string) {
+func (s *Server) writeUnknownName(w http.ResponseWriter, r *http.Request, name string) {
 	n := html.EscapeString(name)
-	add := html.EscapeString(s.dashboardLink() + "?add=" + url.QueryEscape(name))
-	writeMessagePage(w, http.StatusNotFound, "No shortcut named "+n,
-		`Nothing is registered as <b>`+n+`</b>. <a href="`+add+`">Add it on the dashboard</a>.`)
+	body := `Nothing is registered as <b>` + n + `</b>.`
+	if validateName(name) == nil {
+		add := html.EscapeString(s.dashboardLink(r) + "?add=" + url.QueryEscape(name))
+		body += ` <a href="` + add + `">Add it on the dashboard</a>.`
+	}
+	writeMessagePage(w, http.StatusNotFound, "No shortcut named "+n, body)
 }
 
 func (s *Server) writeAppNotResponding(w http.ResponseWriter, r *http.Request, err error) {
-	t := r.Context().Value(proxyTargetKey{}).(proxyTarget)
+	if errors.Is(err, context.Canceled) {
+		return // the browser left; nobody is there to read a page
+	}
+	t := appTargetOf(r)
 	slog.Debug("proxy failed", "name", t.name, "port", t.port, "err", err)
 	n := html.EscapeString(t.name)
 	writeMessagePage(w, http.StatusBadGateway, n+" is not responding",
 		fmt.Sprintf(`<b>%s</b> is registered on port %d, but nothing is answering there. Start the app, or <a href="%s">remove it on the dashboard</a>.`,
-			n, t.port, html.EscapeString(s.dashboardLink())))
+			n, t.port, html.EscapeString(s.dashboardLink(r))))
 }
 
 func writeMessagePage(w http.ResponseWriter, status int, title, body string) {
@@ -384,10 +366,11 @@ func writeMessagePage(w http.ResponseWriter, status int, title, body string) {
 <h1>%s</h1><p>%s</p>`, title, title, body)
 }
 
-// maintain persists the registry, reaps exited apps and keeps the hosts file
-// in step with the names.
+// maintain persists the registry, drops names of apps that exited and keeps
+// the hosts file in step with the names, until ctx is done.
 func (s *Server) maintain(ctx context.Context, hostsPath, ip string) {
-	syncHostsLogged(hostsPath, ip, s.reg.Names())
+	hosts := &hostsSyncer{path: hostsPath, ip: ip}
+	hosts.sync(s.reg.Names())
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -399,18 +382,12 @@ func (s *Server) maintain(ctx context.Context, hostsPath, ip string) {
 				slog.Info("app exited, name removed", "name", name)
 			}
 			s.reg.SaveIfDirty()
+			// Also retries a failed sync, and restores hop's block if
+			// something else rewrote the file.
+			hosts.sync(s.reg.Names())
 		case <-s.reg.changed:
 			s.reg.SaveIfDirty()
-			syncHostsLogged(hostsPath, ip, s.reg.Names())
+			hosts.sync(s.reg.Names())
 		}
-	}
-}
-
-func syncHostsLogged(path, ip string, names []string) {
-	if path == "" {
-		return
-	}
-	if err := syncHosts(path, ip, names); err != nil {
-		slog.Error("hosts sync failed", "err", err)
 	}
 }

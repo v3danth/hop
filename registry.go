@@ -47,19 +47,33 @@ func (e *NameTakenError) Error() string {
 	return e.Existing.Name + "/ already goes to " + e.Existing.target()
 }
 
-// Names must be valid DNS labels so they work as hosts-file entries.
-var namePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+var (
+	// Names must be valid DNS labels so they work as hosts-file entries.
+	namePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	// Browsers read these as IPv4 addresses, not names: http://123/ opens
+	// 0.0.0.123, and 0x1f is hexadecimal.
+	ipv4LikeName = regexp.MustCompile(`^(?:[0-9]+|0x[0-9a-f]*)$`)
+)
 
 // The server itself answers on these names; registering one would hide the
 // dashboard.
 var reservedNames = []string{"go", "hop", "localhost"}
 
-func validateService(s Service) error {
-	if !namePattern.MatchString(s.Name) {
-		return fmt.Errorf("name %q can only use lowercase letters, digits and dashes", s.Name)
+func validateName(name string) error {
+	switch {
+	case !namePattern.MatchString(name):
+		return fmt.Errorf("name %q can only use lowercase letters, digits and dashes", name)
+	case ipv4LikeName.MatchString(name):
+		return fmt.Errorf("name %q would be read as an IP address by browsers; add a letter", name)
+	case slices.Contains(reservedNames, name):
+		return fmt.Errorf("name %q is reserved for hop itself", name)
 	}
-	if slices.Contains(reservedNames, s.Name) {
-		return fmt.Errorf("name %q is reserved for hop itself", s.Name)
+	return nil
+}
+
+func validateService(s Service) error {
+	if err := validateName(s.Name); err != nil {
+		return err
 	}
 	switch {
 	case s.URL != "" && s.Port != 0:
@@ -83,10 +97,12 @@ func validateService(s Service) error {
 // Registry is the name table, persisted as JSON so links survive restarts.
 type Registry struct {
 	path    string
-	mu      sync.Mutex
-	byName  map[string]Service
-	dirty   bool
 	changed chan struct{} // signals the maintenance loop that names changed
+	saveMu  sync.Mutex    // one save at a time, so an older snapshot never lands last
+
+	mu     sync.Mutex
+	byName map[string]Service
+	dirty  bool
 	// lastRemoved lets the dashboard's Undo restore a name with its history.
 	lastRemoved Service
 }
@@ -105,6 +121,12 @@ func loadRegistry(path string) (*Registry, error) {
 		return nil, fmt.Errorf("parse registry %s: %w", path, err)
 	}
 	for _, s := range list {
+		// Names end up in /etc/hosts, so a hand-edited or tampered file must
+		// not be able to slip in other host entries.
+		if err := validateService(s); err != nil {
+			slog.Warn("skipping invalid registry entry", "path", path, "err", err)
+			continue
+		}
 		r.byName[s.Name] = s
 	}
 	return r, nil
@@ -119,33 +141,21 @@ func (r *Registry) markChanged() {
 	}
 }
 
-// Put adds or replaces a service. Visit counts carry over so re-registering an
-// app on a new port, or undoing the last removal, keeps its history.
-func (r *Registry) Put(s Service) (Service, error) {
+// Put registers s. If the name is taken it replaces the old entry when
+// replace is set, and otherwise returns a *NameTakenError, unless the old
+// entry is the same registration: same target and same owning process.
+// Visit history carries over, so an app restarting on a new port, or an
+// undone removal, keeps its counts.
+func (r *Registry) Put(s Service, replace bool) (Service, error) {
 	if err := validateService(s); err != nil {
 		return Service{}, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	s.Created = time.Now()
-	if old, ok := r.historyOf(s.Name); ok {
-		s.Created, s.Hits, s.LastHit = old.Created, old.Hits, old.LastHit
-	}
-	r.byName[s.Name] = s
-	r.markChanged()
-	return s, nil
-}
-
-// Add registers s only if the name is free. Adding the same name with the
-// same target again is a no-op, so scripts can run it repeatedly.
-func (r *Registry) Add(s Service) (Service, error) {
-	if err := validateService(s); err != nil {
-		return Service{}, err
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if old, ok := r.byName[s.Name]; ok {
-		if old.target() == s.target() {
+	if old, ok := r.byName[s.Name]; ok && !replace {
+		// A matching target alone is not enough: a permanent shortcut must
+		// not stay tied to an app's process, which would drop it on exit.
+		if old.target() == s.target() && old.PID == s.PID {
 			return old, nil
 		}
 		return Service{}, &NameTakenError{Existing: old}
@@ -167,11 +177,14 @@ func (r *Registry) historyOf(name string) (Service, bool) {
 	return r.lastRemoved, r.lastRemoved.Name == name
 }
 
-func (r *Registry) Remove(name string) bool {
+// Remove deletes name and reports whether it did. With pid > 0 it deletes
+// the name only while that process holds it, so an app that exits cannot
+// remove a name a newer run of the app took over.
+func (r *Registry) Remove(name string, pid int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.byName[name]
-	if !ok {
+	if !ok || (pid > 0 && s.PID != pid) {
 		return false
 	}
 	r.lastRemoved = s
@@ -244,14 +257,18 @@ func isProcessAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// SaveIfDirty writes the registry if it changed. A failed save is logged
+// and retried on the next call.
 func (r *Registry) SaveIfDirty() {
+	r.saveMu.Lock()
+	defer r.saveMu.Unlock()
 	r.mu.Lock()
-	if !r.dirty {
-		r.mu.Unlock()
-		return
-	}
+	dirty := r.dirty
 	r.dirty = false
 	r.mu.Unlock()
+	if !dirty {
+		return
+	}
 	if err := r.save(); err != nil {
 		slog.Error("save registry failed", "path", r.path, "err", err)
 		r.mu.Lock()
@@ -265,75 +282,38 @@ func (r *Registry) save() error {
 	if err != nil {
 		return fmt.Errorf("encode registry: %w", err)
 	}
-	dir := filepath.Dir(r.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create %s: %w", dir, err)
-	}
-	return writeFileAtomic(r.path, b, 0o644)
+	return writeFileAtomic(r.path, b, 0o600)
 }
 
-// A crash mid-write must never leave a half-written registry or hosts file,
-// so write a temp file next to path and rename it over the old one. The
-// daemon runs as root, so the file takes the owner of its directory;
-// otherwise root would own the registry in the user's home.
-func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+// writeFileAtomic replaces path with b. A crash mid-write must never leave a
+// half-written registry or hosts file, so it writes a temp file next to path,
+// syncs it and renames it over the old one.
+func writeFileAtomic(path string, b []byte, perm os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
-	defer os.Remove(tmp.Name())
-	if err := writeAndClose(tmp, b, perm, dir); err != nil {
-		return err
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+		}
+	}()
+	if _, err := tmp.Write(b); err != nil {
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	// Without a sync, a power cut after the rename can leave an empty file.
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return fmt.Errorf("replace %s: %w", path, err)
 	}
 	return nil
-}
-
-func writeAndClose(f *os.File, b []byte, perm os.FileMode, ownerDir string) error {
-	if err := prepareTemp(f, b, perm, ownerDir); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	return nil
-}
-
-func prepareTemp(f *os.File, b []byte, perm os.FileMode, ownerDir string) error {
-	if _, err := f.Write(b); err != nil {
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	if err := f.Chmod(perm); err != nil {
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	if os.Geteuid() == 0 {
-		uid, gid, err := ownerOf(ownerDir)
-		if err != nil {
-			return err
-		}
-		if err := f.Chown(uid, gid); err != nil {
-			return fmt.Errorf("chown temp file: %w", err)
-		}
-	}
-	// Without a sync, a power cut after the rename can leave an empty file.
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	return nil
-}
-
-func ownerOf(path string) (uid, gid int, err error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, 0, fmt.Errorf("stat %s: %w", path, err)
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, 0, fmt.Errorf("stat %s: no owner information", path)
-	}
-	return int(st.Uid), int(st.Gid), nil
 }

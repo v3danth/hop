@@ -3,40 +3,38 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"text/tabwriter"
-	"time"
 )
 
-// defaultAddr gives hop its own loopback address. Browsers need port 80 for
-// links like yt/, and a separate address leaves 127.0.0.1:80 (localhost)
-// free for other apps. The CLI and MCP server assume it unless $HOP_URL is set.
-const defaultAddr = "127.0.0.2:80"
+// hop listens on its own loopback address. Browsers need port 80 for links
+// like yt/, and a separate address leaves localhost (127.0.0.1) free for
+// other apps. The CLI and MCP server assume it unless $HOP_URL is set.
+const (
+	defaultIP   = "127.0.0.2"
+	defaultAddr = defaultIP + ":80"
+)
 
 const usage = `hop: short names for websites and local apps
 
 Usage:
-  hop serve [-addr 127.0.0.2:80] [-data FILE] [-hosts /etc/hosts]
-  hop ls                          list shortcuts
-  hop add [-f] <name> <url|port>  e.g. hop add yt youtube.com; -f replaces an existing name
-  hop rm <name>                   remove a shortcut
-  hop run <name> -- <command...>  run an app on a free port (given as $PORT)
-  hop port                        print a free port
-  hop mcp                         MCP server for Claude Code (stdio)
+  hop ls                               list shortcuts
+  hop add [-f] <name> <url|port>       e.g. hop add yt youtube.com; -f replaces an existing name
+  hop rm <name>                        remove a shortcut
+  hop run [-f] <name> -- <command...>  run an app on a free port (given as $PORT)
+  hop port                             print a free port
+  hop mcp                              MCP server for Claude Code (stdio)
+  hop serve [flags]                    the server itself; see hop serve -h
 
-The CLI talks to the server at $HOP_URL (default http://127.0.0.2).
+The CLI talks to the server at $HOP_URL (default http://` + defaultIP + `).
 `
 
 var commands = map[string]func([]string) error{
@@ -54,6 +52,11 @@ func main() {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
+	switch os.Args[1] {
+	case "help", "-h", "-help", "--help":
+		fmt.Print(usage)
+		return
+	}
 	cmd, ok := commands[os.Args[1]]
 	if !ok {
 		fmt.Fprint(os.Stderr, usage)
@@ -63,122 +66,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "hop:", err)
 		os.Exit(1)
 	}
-}
-
-func serveCmd(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	addr := fs.String("addr", defaultAddr, "address to listen on; hosts entries point at its IP")
-	data := fs.String("data", "", "registry file (default ~/.hop/registry.json)")
-	hosts := fs.String("hosts", "", "hosts file to keep in sync, e.g. /etc/hosts (enables single-word names like yt/)")
-	tlsAddr := fs.String("tls-addr", "", `HTTPS address (default: the -addr IP on port 443; "off" disables)`)
-	caDir := fs.String("ca-dir", "", "directory for the local CA that signs HTTPS certificates (default: next to -data)")
-	fs.Parse(args)
-	// launchd daemons have no $HOME, so only look it up when -data is missing.
-	if *data == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("find home directory (or pass -data): %w", err)
-		}
-		*data = filepath.Join(home, ".hop", "registry.json")
-	}
-
-	listenHost, portText, err := net.SplitHostPort(*addr)
-	if err != nil {
-		return fmt.Errorf("parse -addr: %w", err)
-	}
-	hostsIP, err := loopbackIP(listenHost)
-	if err != nil {
-		return err
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		return fmt.Errorf("parse -addr port: %w", err)
-	}
-	reg, err := loadRegistry(*data)
-	if err != nil {
-		return err
-	}
-	reg.ReapDead()
-	ln, err := listenLoopback(*addr)
-	if err != nil {
-		return err
-	}
-	srv := newServer(reg, port, *hosts != "")
-	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
-
-	var tlsLn net.Listener
-	if *tlsAddr != "off" {
-		if *tlsAddr == "" {
-			*tlsAddr = net.JoinHostPort(listenHost, "443")
-		}
-		tlsHost, _, err := net.SplitHostPort(*tlsAddr)
-		if err != nil {
-			return fmt.Errorf("parse -tls-addr: %w", err)
-		}
-		if _, err := loopbackIP(tlsHost); err != nil {
-			return err
-		}
-		if *caDir == "" {
-			*caDir = filepath.Join(filepath.Dir(*data), "ca")
-		}
-		caCert, caKey, err := loadOrCreateCA(*caDir)
-		if err != nil {
-			return err
-		}
-		hs.TLSConfig = newCertIssuer(caCert, caKey, srv.servesName).tlsConfig()
-		if tlsLn, err = listenLoopback(*tlsAddr); err != nil {
-			return err
-		}
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go srv.maintain(ctx, *hosts, hostsIP)
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := hs.Shutdown(shutdownCtx); err != nil {
-			slog.Warn("shutdown cut open connections", "err", err)
-		}
-	}()
-
-	slog.Info("hop listening", "addr", *addr, "tls", *tlsAddr, "ca", *caDir, "registry", *data, "hosts", *hosts, "dashboard", srv.serviceLink("hop")+"/")
-	// One server, two listeners, so Shutdown stops both.
-	stopped := make(chan error, 2)
-	go func() { stopped <- hs.Serve(ln) }()
-	if tlsLn != nil {
-		go func() { stopped <- hs.ServeTLS(tlsLn, "", "") }()
-	}
-	if err := <-stopped; !errors.Is(err, http.ErrServerClosed) {
-		hs.Close()
-		return fmt.Errorf("serve: %w", err)
-	}
-	reg.SaveIfDirty()
-	slog.Info("hop stopped")
-	return nil
-}
-
-func listenLoopback(addr string) (net.Listener, error) {
-	ln, err := net.Listen("tcp", addr)
-	if errors.Is(err, syscall.EADDRNOTAVAIL) {
-		host, _, _ := net.SplitHostPort(addr)
-		return nil, fmt.Errorf("listen on %s: macOS only enables 127.0.0.1 by default; run `sudo ifconfig lo0 alias %s up` first: %w", addr, host, err)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", addr, err)
-	}
-	return ln, nil
-}
-
-// loopbackIP is the address hosts entries point at. hop must listen on one
-// loopback address, since a wildcard would expose it to the network.
-func loopbackIP(host string) (string, error) {
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return "", fmt.Errorf("-addr must use a loopback IP such as 127.0.0.2, not %q", host)
-	}
-	return ip.String(), nil
 }
 
 func listCmd([]string) error {
@@ -199,7 +86,9 @@ func addCmd(args []string) error {
 	var force bool
 	fs.BoolVar(&force, "f", false, "replace the name if it already exists")
 	fs.BoolVar(&force, "force", false, "same as -f")
-	fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	if fs.NArg() != 2 {
 		return errors.New("usage: hop add [-f] <name> <url|port>")
 	}
@@ -221,7 +110,7 @@ func removeCmd(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: hop rm <name>")
 	}
-	return newClient().remove(args[0])
+	return newClient().remove(args[0], 0)
 }
 
 func portCmd([]string) error {
@@ -233,44 +122,51 @@ func portCmd([]string) error {
 	return nil
 }
 
-// runCmd starts an app on a free port and registers it under name for as long
-// as it runs. The server also reaps the name by PID if this wrapper is killed.
+// runCmd starts an app on a free port and names it for as long as it runs.
+// The server also drops the name by PID if this wrapper is killed.
 func runCmd(args []string) error {
-	if len(args) < 3 || args[1] != "--" {
-		return errors.New("usage: hop run <name> -- <command...>")
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	force := fs.Bool("f", false, "use the name even if it is a permanent shortcut")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	name, argv := args[0], args[2:]
+	rest := fs.Args()
+	if len(rest) < 3 || rest[1] != "--" {
+		return errors.New("usage: hop run [-f] <name> -- <command...>")
+	}
+	name, argv := strings.ToLower(rest[0]), rest[2:]
+	c := newClient()
+	replace, err := claimMode(c, name, *force)
+	if err != nil {
+		return err
+	}
 	port, err := freePort()
 	if err != nil {
 		return err
 	}
+
+	// Catch signals before the child exists, so a Ctrl-C right after start
+	// cannot kill this wrapper before it unregisters the name.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), "PORT="+strconv.Itoa(port), "HOP_NAME="+name)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", argv[0], err)
 	}
+	go forwardTerminate(signals, cmd.Process)
 
-	c := newClient()
-	if view, err := c.put(Service{Name: name, Port: port, PID: cmd.Process.Pid}, true); err != nil {
+	pid := cmd.Process.Pid
+	if view, err := c.put(Service{Name: name, Port: port, PID: pid}, replace); err != nil {
 		fmt.Fprintf(os.Stderr, "hop: running on port %d, but could not register %s: %v\n", port, name, err)
 	} else {
 		fmt.Fprintf(os.Stderr, "hop: %s -> %s (port %d)\n", name, view.Link, port)
 	}
-
-	// Ctrl-C reaches the child through the terminal's process group; the
-	// wrapper only forwards SIGTERM and waits so it can unregister afterwards.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		for sig := range signals {
-			if sig == syscall.SIGTERM {
-				cmd.Process.Signal(sig)
-			}
-		}
-	}()
 	waitErr := cmd.Wait()
-	if err := c.remove(name); err != nil {
+	// Passing the PID removes the name only while this app still holds it,
+	// not after a newer run of the app took it over.
+	if err := c.remove(name, pid); err != nil && !isNotFound(err) {
 		fmt.Fprintf(os.Stderr, "hop: could not remove %s, the server will drop it within seconds: %v\n", name, err)
 	}
 
@@ -283,4 +179,41 @@ func runCmd(args []string) error {
 		os.Exit(exitErr.ExitCode())
 	}
 	return waitErr
+}
+
+// claimMode reports whether hop run should replace an existing name. A name
+// held by an earlier run of an app (it has a PID) is taken over, since that
+// is usually the same app restarting; a permanent shortcut needs -f.
+func claimMode(c client, name string, force bool) (replace bool, err error) {
+	if force {
+		return true, nil
+	}
+	resp, err := c.list()
+	if err != nil {
+		// Without a server the app still runs; registering it will say why.
+		return false, nil
+	}
+	for _, s := range resp.Services {
+		if s.Name != name {
+			continue
+		}
+		if s.PID > 0 {
+			return true, nil
+		}
+		return false, fmt.Errorf("%s/ already goes to %s\nTo use the name for this app anyway: hop run -f %s -- <command>", name, s.target(), name)
+	}
+	return false, nil
+}
+
+// forwardTerminate passes SIGTERM on to the app. Ctrl-C needs no forwarding:
+// the terminal sends it to the whole process group, the app included.
+func forwardTerminate(signals <-chan os.Signal, p *os.Process) {
+	for sig := range signals {
+		if sig != syscall.SIGTERM {
+			continue
+		}
+		if err := p.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			fmt.Fprintln(os.Stderr, "hop: could not pass SIGTERM to the app:", err)
+		}
+	}
 }
