@@ -69,6 +69,10 @@ is root-only. `./install.sh uninstall` removes the trust and deletes the CA. Saf
 Chrome use the System keychain; Firefox does too unless
 `security.enterprise_roots.enabled` is turned off.
 
+The install adds one certificate: a root CA named `hop local CA` (ECDSA P-256, valid
+10 years) in the System keychain. See it in Keychain Access → System → Certificates;
+remove it with `./install.sh uninstall`.
+
 ## Notes
 
 - The API only answers local host names, rejects cross-site `Origin`s and needs a JSON
