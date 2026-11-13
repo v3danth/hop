@@ -206,6 +206,16 @@ func sameMachineOnly(next http.Handler) http.Handler {
 	})
 }
 
+// servesName reports whether hop answers for name, which is what the HTTPS
+// certificate issuer may sign.
+func (s *Server) servesName(name string) bool {
+	if isHopHost(name) {
+		return true
+	}
+	_, ok := s.reg.Lookup(name)
+	return ok
+}
+
 // isHopHost reports whether host means hop itself: its names, or a loopback
 // IP such as 127.0.0.2 that the CLI uses to reach it.
 func isHopHost(host string) bool {

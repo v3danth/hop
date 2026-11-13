@@ -10,9 +10,9 @@ One Go binary, no dependencies.
 ```
 
 Builds hop, installs it to `/usr/local/bin/hop`, and runs it as a launchd daemon that
-keeps a managed block of `/etc/hosts` in sync. It listens on port 80 of its own loopback
-address, `127.0.0.2`, so links need no port while `localhost:80` stays free for your
-other apps. Needs sudo. `./install.sh uninstall` removes it again.
+keeps a managed block of `/etc/hosts` in sync. It listens on ports 80 and 443 of its own
+loopback address, `127.0.0.2`, so links need no port while `localhost` stays free for
+your other apps. Needs sudo. `./install.sh uninstall` removes it again.
 
 Dashboard: http://hop/
 
@@ -27,7 +27,7 @@ hop ls
 hop rm yt
 ```
 
-Every name works as `name/` and `go/name/...`. Type the `/` (or `http://`) the first
+Every name works as `name/`, `https://name/` and `go/name/...`. Type the `/` (or `http://`) the first
 time, so the browser does not search for the word.
 
 ## From any language
@@ -55,6 +55,19 @@ claude mcp add -s user hop -- /usr/local/bin/hop mcp
 ```
 
 Tools: `list_services`, `register_service`, `remove_service`, `free_port`.
+
+## HTTPS
+
+`https://yt` needs a certificate for `yt`, which no public CA issues, so hop runs its
+own local CA, the way `mkcert` does. On first start it creates the CA in
+`/Library/Application Support/hop` (root-only, key `0600`), and `install.sh` trusts it
+in the System keychain. hop then signs a one-year certificate per name on first use,
+and only for names it serves, so the CA never signs for a real website.
+
+Anyone who can read the CA key could impersonate any site to this Mac, which is why it
+is root-only. `./install.sh uninstall` removes the trust and deletes the CA. Safari and
+Chrome use the System keychain; Firefox does too unless
+`security.enterprise_roots.enabled` is turned off.
 
 ## Notes
 

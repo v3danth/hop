@@ -70,6 +70,8 @@ func serveCmd(args []string) error {
 	addr := fs.String("addr", defaultAddr, "address to listen on; hosts entries point at its IP")
 	data := fs.String("data", "", "registry file (default ~/.hop/registry.json)")
 	hosts := fs.String("hosts", "", "hosts file to keep in sync, e.g. /etc/hosts (enables single-word names like yt/)")
+	tlsAddr := fs.String("tls-addr", "", `HTTPS address (default: the -addr IP on port 443; "off" disables)`)
+	caDir := fs.String("ca-dir", "", "directory for the local CA that signs HTTPS certificates (default: next to -data)")
 	fs.Parse(args)
 	// launchd daemons have no $HOME, so only look it up when -data is missing.
 	if *data == "" {
@@ -97,19 +99,41 @@ func serveCmd(args []string) error {
 		return err
 	}
 	reg.ReapDead()
-	ln, err := net.Listen("tcp", *addr)
-	if errors.Is(err, syscall.EADDRNOTAVAIL) {
-		return fmt.Errorf("listen on %s: macOS only enables 127.0.0.1 by default; run `sudo ifconfig lo0 alias %s up` first: %w", *addr, listenHost, err)
-	}
+	ln, err := listenLoopback(*addr)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", *addr, err)
+		return err
+	}
+	srv := newServer(reg, port, *hosts != "")
+	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+
+	var tlsLn net.Listener
+	if *tlsAddr != "off" {
+		if *tlsAddr == "" {
+			*tlsAddr = net.JoinHostPort(listenHost, "443")
+		}
+		tlsHost, _, err := net.SplitHostPort(*tlsAddr)
+		if err != nil {
+			return fmt.Errorf("parse -tls-addr: %w", err)
+		}
+		if _, err := loopbackIP(tlsHost); err != nil {
+			return err
+		}
+		if *caDir == "" {
+			*caDir = filepath.Join(filepath.Dir(*data), "ca")
+		}
+		caCert, caKey, err := loadOrCreateCA(*caDir)
+		if err != nil {
+			return err
+		}
+		hs.TLSConfig = newCertIssuer(caCert, caKey, srv.servesName).tlsConfig()
+		if tlsLn, err = listenLoopback(*tlsAddr); err != nil {
+			return err
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	srv := newServer(reg, port, *hosts != "")
 	go srv.maintain(ctx, *hosts, hostsIP)
-	hs := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -119,13 +143,32 @@ func serveCmd(args []string) error {
 		}
 	}()
 
-	slog.Info("hop listening", "addr", *addr, "registry", *data, "hosts", *hosts, "dashboard", srv.serviceLink("hop")+"/")
-	if err := hs.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+	slog.Info("hop listening", "addr", *addr, "tls", *tlsAddr, "ca", *caDir, "registry", *data, "hosts", *hosts, "dashboard", srv.serviceLink("hop")+"/")
+	// One server, two listeners, so Shutdown stops both.
+	stopped := make(chan error, 2)
+	go func() { stopped <- hs.Serve(ln) }()
+	if tlsLn != nil {
+		go func() { stopped <- hs.ServeTLS(tlsLn, "", "") }()
+	}
+	if err := <-stopped; !errors.Is(err, http.ErrServerClosed) {
+		hs.Close()
 		return fmt.Errorf("serve: %w", err)
 	}
 	reg.SaveIfDirty()
 	slog.Info("hop stopped")
 	return nil
+}
+
+func listenLoopback(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if errors.Is(err, syscall.EADDRNOTAVAIL) {
+		host, _, _ := net.SplitHostPort(addr)
+		return nil, fmt.Errorf("listen on %s: macOS only enables 127.0.0.1 by default; run `sudo ifconfig lo0 alias %s up` first: %w", addr, host, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	return ln, nil
 }
 
 // loopbackIP is the address hosts entries point at. hop must listen on one
