@@ -1,0 +1,2 @@
+# Built binary (install.sh builds into a temp dir; `go build` drops it here).
+/hop

@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hop</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f7f8fa; --surface: #ffffff; --border: #e3e6ea; --control-border: #868f99; --text: #1f2328; --muted: #5f6b7a;
+  --accent: #2f6fde; --accent-hover: #2459b8; --on-accent: #ffffff;
+  --up: #1a7f4b; --down: #b54708; --danger: #c4314b; --focus: #2f6fde;
+  --row-hover: #f2f5f9; --toast-bg: #1f2328; --toast-text: #ffffff;
+  --radius: 8px; --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111316; --surface: #1a1d21; --border: #2c3138; --control-border: #6b7480; --text: #e6e8eb; --muted: #9aa4b1;
+    --accent: #5b93f0; --accent-hover: #7cabf5; --on-accent: #0b1220;
+    --up: #4cc38a; --down: #f0a35b; --danger: #f2788d; --focus: #7cabf5;
+    --row-hover: #20242a; --toast-bg: #e6e8eb; --toast-text: #111316;
+  }
+}
+* { box-sizing: border-box; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--font); }
+main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 96px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+h1 { font-size: 24px; line-height: 1.2; font-weight: 600; margin: 0; }
+.sub { color: var(--muted); margin: 0; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; }
+form.add { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto; gap: 12px; padding: 16px; align-items: end; }
+label { display: block; font-size: 12px; font-weight: 500; color: var(--muted); margin-bottom: 4px; }
+input { width: 100%; height: 40px; padding: 0 12px; font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--control-border); border-radius: var(--radius); }
+input:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+input[aria-invalid="true"] { border-color: var(--danger); }
+.hint { font-size: 12px; color: var(--muted); margin-top: 4px; min-height: 18px; }
+.hint.error { color: var(--danger); }
+button { white-space: nowrap; height: 40px; padding: 0 16px; font: inherit; font-weight: 500; border-radius: var(--radius); cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+button:hover { background: var(--row-hover); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.primary:hover { background: var(--accent-hover); }
+button.primary:disabled { opacity: .55; cursor: not-allowed; }
+button.small { height: 32px; padding: 0 10px; font-size: 13px; }
+button.danger { color: var(--danger); }
+.add-btn { margin-bottom: 22px; }
+.toolbar { display: flex; gap: 12px; align-items: center; justify-content: space-between; margin: 24px 0 12px; flex-wrap: wrap; }
+.toolbar input { max-width: 280px; }
+.count { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-size: 12px; font-weight: 500; color: var(--muted); padding: 10px 16px; border-bottom: 1px solid var(--border); }
+td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: var(--row-hover); }
+.name a { font-weight: 600; color: var(--accent); text-decoration: none; overflow-wrap: anywhere; }
+.name { min-width: 26ch; }
+/* max-width: 0 lets this column take the leftover width and ellipsize, so long URLs never push the actions out of the panel. */
+.target-cell { width: 100%; max-width: 0; }
+.name a:hover { text-decoration: underline; }
+.target { font-family: var(--mono); font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.num { font-variant-numeric: tabular-nums; }
+.when { white-space: nowrap; color: var(--muted); }
+.status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.status.up { color: var(--up); } .status.down { color: var(--down); } .status.redirect { color: var(--muted); }
+.actions { display: flex; gap: 8px; justify-content: flex-end; }
+.tag { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 6px; margin-left: 6px; }
+.empty { padding: 48px 16px; text-align: center; color: var(--muted); }
+.empty h2 { font-size: 16px; color: var(--text); margin: 0 0 8px; font-weight: 600; }
+.empty code, .help code { font-family: var(--mono); font-size: 13px; background: var(--bg); padding: 1px 6px; border-radius: 4px; }
+.help { margin-top: 32px; color: var(--muted); }
+.help h2 { font-size: 14px; color: var(--text); font-weight: 600; margin: 0 0 8px; }
+.help p { margin: 4px 0; }
+.toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--toast-bg); color: var(--toast-text);
+  border-radius: var(--radius); padding: 10px 12px 10px 16px; display: flex; gap: 16px; align-items: center; box-shadow: 0 8px 24px rgba(0,0,0,.2); }
+.toast button { height: 30px; background: transparent; color: inherit; border-color: currentColor; }
+.toast[hidden] { display: none; }
+.banner { padding: 12px 16px; margin-bottom: 16px; border: 1px solid var(--danger); color: var(--danger); border-radius: var(--radius); }
+.banner[hidden] { display: none; }
+@media (max-width: 720px) {
+  form.add { grid-template-columns: 1fr; }
+  .add-btn { margin-bottom: 0; }
+  thead { display: none; }
+  table, tbody, tr, td { display: block; }
+  tr { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  tr:last-child { border-bottom: 0; }
+  td { border: 0; padding: 4px 16px; }
+  td[data-label]::before { content: attr(data-label) ": "; color: var(--muted); font-size: 12px; }
+  .target-cell { max-width: none; }
+  .target { white-space: normal; overflow-wrap: anywhere; }
+  input, button, button.small { height: 44px; }
+  .name a { display: inline-block; padding: 12px 0; }
+  .actions { justify-content: flex-start; padding-top: 8px; }
+}
+@media (prefers-reduced-motion: no-preference) { tbody tr { transition: background .15s ease-out; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>hop</h1>
+    <p class="sub">Short names for your sites and local apps</p>
+  </header>
+
+  <div class="banner" id="banner" role="alert" hidden></div>
+
+  <form class="add panel" id="add-form" novalidate>
+    <div>
+      <label for="name">Name</label>
+      <input id="name" name="name" placeholder="e.g. yt" autocomplete="off" spellcheck="false" aria-describedby="name-hint">
+      <div class="hint" id="name-hint">Lowercase letters, digits and dashes</div>
+    </div>
+    <div>
+      <label for="target">Goes to</label>
+      <input id="target" name="target" placeholder="e.g. youtube.com or 3000" autocomplete="off" spellcheck="false" aria-describedby="target-hint">
+      <div class="hint" id="target-hint">A website, or the port a local app listens on. Use %s for a search term.</div>
+    </div>
+    <button class="primary add-btn" type="submit" id="add-btn">Add shortcut</button>
+  </form>
+
+  <div class="toolbar">
+    <input id="filter" type="search" placeholder="Filter  ( / )" aria-label="Filter shortcuts">
+    <span class="count" id="count" aria-live="polite"></span>
+  </div>
+
+  <div class="panel">
+    <table>
+      <thead><tr><th>Name</th><th>Goes to</th><th>Status</th><th class="num">Visits</th><th>Last visit</th><th><span class="sr">Actions</span></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>
+      <h2>No shortcuts yet</h2>
+      <p>Add one above, or start an app with <code>hop run my-app -- npm run dev</code>.</p>
+    </div>
+    <div class="empty" id="no-match" hidden>
+      <h2 id="no-match-title"></h2>
+      <p><button class="small" type="button" id="clear-filter">Clear filter</button></p>
+    </div>
+  </div>
+
+  <section class="help">
+    <h2>Other ways to add names</h2>
+    <p>Terminal: <code>hop add yt youtube.com</code> or <code>hop add api 8080</code></p>
+    <p>Any app, any language: <code>POST /_hop/api/services {"name":"api","port":8080,"pid":123}</code></p>
+    <p>Claude Code: <code>claude mcp add -s user hop -- hop mcp</code></p>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" hidden><span id="toast-text"></span><button class="small" id="undo">Undo</button></div>
+
+<script>
+'use strict';
+const API = '/_hop/api/services';
+const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+const RESERVED = ['go', 'hop', 'localhost'];
+const STATUS = {
+  up: {icon: '●', text: 'Running'},
+  down: {icon: '○', text: 'Not responding'},
+  redirect: {icon: '↗', text: 'Redirect'},
+};
+
+const $ = (id) => document.getElementById(id);
+let services = [];
+let undoTimer = 0;
+
+function relativeTime(iso) {
+  if (!iso) return 'Never';
+  const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'Just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
+}
+
+function targetText(svc) {
+  return svc.port ? `localhost:${svc.port}` : svc.url;
+}
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') node.className = v;
+    else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  node.append(...children);
+  return node;
+}
+
+function serviceRow(svc) {
+  const st = STATUS[svc.status] || STATUS.redirect;
+  const linkText = svc.link.replace(/^http:\/\//, '');
+  return el('tr', {},
+    el('td', {class: 'name'}, el('a', {href: svc.link, target: '_blank', rel: 'noopener', title: svc.link}, linkText),
+      svc.pid ? el('span', {class: 'tag', title: `Removed automatically when process ${svc.pid} exits`}, 'auto') : ''),
+    el('td', {'data-label': 'Goes to', class: 'target-cell'}, el('div', {class: 'target', title: targetText(svc)}, targetText(svc))),
+    el('td', {'data-label': 'Status'}, el('span', {class: `status ${svc.status}`}, el('span', {'aria-hidden': 'true'}, st.icon), st.text)),
+    el('td', {'data-label': 'Visits', class: 'num'}, String(svc.hits)),
+    el('td', {'data-label': 'Last visit', class: 'when', title: svc.lastHit || ''}, relativeTime(svc.lastHit)),
+    el('td', {},
+      el('div', {class: 'actions'},
+        el('button', {class: 'small', type: 'button', onclick: (e) => copyLink(svc, e.currentTarget)}, 'Copy link'),
+        el('button', {class: 'small danger', type: 'button', onclick: () => removeService(svc)}, 'Remove'))));
+}
+
+function render() {
+  const q = $('filter').value.trim().toLowerCase();
+  const shown = services.filter((s) => !q || s.name.includes(q) || targetText(s).toLowerCase().includes(q));
+  $('rows').replaceChildren(...shown.map(serviceRow));
+  $('empty').hidden = services.length > 0;
+  $('no-match').hidden = shown.length > 0 || services.length === 0;
+  $('no-match-title').textContent = `No shortcuts match "${q}"`;
+  const n = services.length;
+  $('count').textContent = q ? `${shown.length} of ${n}` : `${n} ${n === 1 ? 'shortcut' : 'shortcuts'}`;
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? {'Content-Type': 'application/json'} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    const err = new Error(body.error || `Request failed with status ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+async function refresh() {
+  try {
+    const data = await api('GET', API);
+    services = data.services;
+    $('banner').hidden = true;
+    render();
+  } catch (e) {
+    $('banner').textContent = 'Can\'t reach hop. Is the server still running? Retrying every few seconds.';
+    $('banner').hidden = false;
+  }
+}
+
+function parseTarget(raw) {
+  const t = raw.trim();
+  if (/^\d+$/.test(t)) return {port: Number(t)};
+  if (!t) return {};
+  return {url: t.includes('://') ? t : `https://${t}`};
+}
+
+function setHint(id, msg, isError) {
+  const hint = $(`${id}-hint`);
+  hint.textContent = msg;
+  hint.classList.toggle('error', isError);
+  $(id).setAttribute('aria-invalid', String(isError));
+}
+
+function existingService(name) {
+  return services.find((s) => s.name === name);
+}
+
+function validateForm() {
+  const name = $('name').value.trim().toLowerCase();
+  const existing = existingService(name);
+  const target = parseTarget($('target').value);
+  let ok = true;
+  if (name && (!NAME_RE.test(name) || RESERVED.includes(name))) {
+    setHint('name', RESERVED.includes(name) ? `"${name}" is reserved for hop itself` : 'Use only lowercase letters, digits and dashes', true);
+    ok = false;
+  } else {
+    setHint('name', existing ? `${name}/ already goes to ${targetText(existing)}` : 'Lowercase letters, digits and dashes', false);
+  }
+  if (target.port !== undefined && (target.port < 1 || target.port > 65535)) {
+    setHint('target', 'Ports go from 1 to 65535', true);
+    ok = false;
+  } else {
+    setHint('target', 'A website, or the port a local app listens on. Use %s for a search term.', false);
+  }
+  $('add-btn').disabled = !ok || !name || (!target.port && !target.url);
+  // The button names the consequence, so replacing is never a surprise.
+  $('add-btn').textContent = existing ? 'Replace shortcut' : 'Add shortcut';
+  return ok;
+}
+
+async function addService(e) {
+  e.preventDefault();
+  if (!validateForm()) return;
+  const name = $('name').value.trim().toLowerCase();
+  // Only replace what the person saw they were replacing; a name taken in
+  // the meantime comes back as a 409 instead.
+  const body = {name, ...parseTarget($('target').value), replace: Boolean(existingService(name))};
+  $('add-btn').disabled = true;
+  $('add-btn').textContent = 'Adding…';
+  try {
+    await api('POST', API, body);
+    $('name').value = '';
+    $('target').value = '';
+    $('name').focus();
+    await refresh();
+    validateForm();
+  } catch (err) {
+    // A name taken meanwhile: reload so the button offers to replace it.
+    if (err.status === 409) await refresh();
+    // validateForm resets the hints, so the server's message goes on after it.
+    validateForm();
+    const field = err.status === 409 || err.message.startsWith('name') ? 'name' : 'target';
+    setHint(field, err.message, true);
+  }
+}
+
+async function removeService(svc) {
+  services = services.filter((s) => s.name !== svc.name);
+  render();
+  try {
+    await api('DELETE', `${API}/${encodeURIComponent(svc.name)}`);
+    showToast(`Removed ${svc.name}/`, () => api('POST', API, {name: svc.name, url: svc.url, port: svc.port, pid: svc.pid}).then(refresh));
+    // The focused Remove button left with its row; Undo is the likely next step.
+    $('undo').focus();
+  } catch (err) {
+    showToast(`Couldn't remove ${svc.name}: ${err.message}`);
+    refresh();
+  }
+}
+
+function showToast(text, undo) {
+  clearTimeout(undoTimer);
+  $('toast-text').textContent = text;
+  $('undo').hidden = !undo;
+  $('undo').onclick = () => { $('toast').hidden = true; $('filter').focus(); undo(); };
+  $('toast').hidden = false;
+  undoTimer = setTimeout(() => {
+    if ($('toast').contains(document.activeElement)) $('filter').focus();
+    $('toast').hidden = true;
+  }, 6000);
+}
+
+async function copyLink(svc, button) {
+  try {
+    await navigator.clipboard.writeText(svc.link);
+    button.textContent = 'Copied';
+  } catch {
+    button.textContent = 'Copy failed';
+  }
+  setTimeout(() => { button.textContent = 'Copy link'; }, 1500);
+}
+
+$('add-form').addEventListener('submit', addService);
+$('name').addEventListener('input', validateForm);
+$('target').addEventListener('input', validateForm);
+$('filter').addEventListener('input', render);
+$('clear-filter').addEventListener('click', () => { $('filter').value = ''; render(); $('filter').focus(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+    e.preventDefault();
+    $('filter').focus();
+  }
+});
+
+const prefill = new URLSearchParams(location.search).get('add');
+if (prefill) {
+  $('name').value = prefill;
+  $('target').focus();
+}
+validateForm();
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
